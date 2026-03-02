@@ -663,6 +663,11 @@ void DuckLakeParquetTypeChecker::Fail() {
 void DuckLakeParquetTypeChecker::CheckSignedInteger() {
 	vector<LogicalType> accepted_types;
 
+	// Each signed integer type accepts:
+	// - Smaller or equal signed integers
+	// - Unsigned integers that fit within the signed type's range
+	// E.g., BIGINT accepts: BIGINT, INTEGER, SMALLINT, TINYINT, UINTEGER, USMALLINT, UTINYINT
+	//       INTEGER accepts: INTEGER, SMALLINT, TINYINT, USMALLINT, UTINYINT
 	switch (type.id()) {
 	case LogicalTypeId::BIGINT:
 		accepted_types.push_back(LogicalType::BIGINT);
@@ -690,15 +695,24 @@ void DuckLakeParquetTypeChecker::CheckSignedInteger() {
 void DuckLakeParquetTypeChecker::CheckUnsignedInteger() {
 	vector<LogicalType> accepted_types;
 
+	// Each unsigned integer type accepts:
+	// - Smaller or equal unsigned integers
+	// - Signed integers that fit within the unsigned type (one size smaller)
+	// E.g., UBIGINT accepts: UBIGINT, UINTEGER, USMALLINT, UTINYINT
+	//       UINTEGER accepts: UINTEGER, USMALLINT, UTINYINT
+	//       USMALLINT accepts: USMALLINT, UTINYINT, TINYINT (positive tinyint fits in usmallint)
 	switch (type.id()) {
 	case LogicalTypeId::UBIGINT:
 		accepted_types.push_back(LogicalType::UBIGINT);
+		accepted_types.push_back(LogicalType::INTEGER);
 		DUCKDB_EXPLICIT_FALLTHROUGH;
 	case LogicalTypeId::UINTEGER:
 		accepted_types.push_back(LogicalType::UINTEGER);
+		accepted_types.push_back(LogicalType::SMALLINT);
 		DUCKDB_EXPLICIT_FALLTHROUGH;
 	case LogicalTypeId::USMALLINT:
 		accepted_types.push_back(LogicalType::USMALLINT);
+		accepted_types.push_back(LogicalType::TINYINT);
 		DUCKDB_EXPLICIT_FALLTHROUGH;
 	case LogicalTypeId::UTINYINT:
 		accepted_types.push_back(LogicalType::UTINYINT);
@@ -720,9 +734,22 @@ void DuckLakeParquetTypeChecker::CheckFloatingPoints() {
 		DUCKDB_EXPLICIT_FALLTHROUGH;
 	case LogicalTypeId::FLOAT:
 		accepted_types.push_back(LogicalType::FLOAT);
+		// Accept all integer types (they can be safely cast to float/double)
+		accepted_types.push_back(LogicalType::TINYINT);
+		accepted_types.push_back(LogicalType::SMALLINT);
+		accepted_types.push_back(LogicalType::INTEGER);
+		accepted_types.push_back(LogicalType::BIGINT);
+		accepted_types.push_back(LogicalType::UTINYINT);
+		accepted_types.push_back(LogicalType::USMALLINT);
+		accepted_types.push_back(LogicalType::UINTEGER);
+		accepted_types.push_back(LogicalType::UBIGINT);
 		break;
 	default:
 		throw InternalException("Unknown float type");
+	}
+	// Also accept DECIMAL - it can be cast to float/double
+	if (source_type.id() == LogicalTypeId::DECIMAL) {
+		return;
 	}
 	if (!CheckTypes(accepted_types)) {
 		Fail();
@@ -744,10 +771,25 @@ void DuckLakeParquetTypeChecker::CheckTimestamp() {
 }
 
 void DuckLakeParquetTypeChecker::CheckDecimal() {
-	if (source_type.id() != LogicalTypeId::DECIMAL) {
-		failures.push_back(StringUtil::Format("Expected type \"DECIMAL\" but found type \"%s\"", source_type));
+	// Accept integer types - they can be safely cast to DECIMAL
+	switch (source_type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+		// Integer to decimal is allowed
+		return;
+	case LogicalTypeId::DECIMAL:
+		break;
+	default:
+		failures.push_back(StringUtil::Format("Expected type \"DECIMAL\" or integer type but found type \"%s\"", source_type));
 		Fail();
 	}
+
 	auto source_scale = DecimalType::GetScale(source_type);
 	auto source_precision = DecimalType::GetWidth(source_type);
 	auto target_scale = DecimalType::GetScale(type);
