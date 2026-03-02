@@ -22,6 +22,7 @@
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/client_config.hpp"
+#include <chrono>
 
 namespace duckdb {
 
@@ -1639,14 +1640,30 @@ string DuckLakeTransaction::CommitChanges(DuckLakeCommitState &commit_state,
 
 	// write new name maps
 	if (!new_name_maps.name_maps.empty()) {
+		auto name_map_start = std::chrono::steady_clock::now();
 		auto result = GetNewNameMaps(commit_state);
+		auto after_get_name_maps = std::chrono::steady_clock::now();
+		fprintf(stderr, "[DuckLake Commit]   GetNewNameMaps (%llu maps) took %lld ms\n",
+		        (unsigned long long)result.new_column_mappings.size(),
+		        std::chrono::duration_cast<std::chrono::milliseconds>(after_get_name_maps - name_map_start).count());
 		batch_queries += metadata_manager->WriteNewColumnMappings(result.new_column_mappings);
+		auto after_write_name_maps = std::chrono::steady_clock::now();
+		fprintf(stderr, "[DuckLake Commit]   WriteNewColumnMappings took %lld ms\n",
+		        std::chrono::duration_cast<std::chrono::milliseconds>(after_write_name_maps - after_get_name_maps).count());
 	}
 
 	// write new data / data files
 	if (!table_data_changes.empty()) {
+		auto data_files_start = std::chrono::steady_clock::now();
 		auto result = GetNewDataFiles(batch_queries, commit_state, stats);
+		auto after_get_data_files = std::chrono::steady_clock::now();
+		fprintf(stderr, "[DuckLake Commit]   GetNewDataFiles (%llu files) took %lld ms\n",
+		        (unsigned long long)result.new_files.size(),
+		        std::chrono::duration_cast<std::chrono::milliseconds>(after_get_data_files - data_files_start).count());
 		batch_queries += metadata_manager->WriteNewDataFiles(result.new_files, new_tables_result, new_schemas_result);
+		auto after_write_data_files = std::chrono::steady_clock::now();
+		fprintf(stderr, "[DuckLake Commit]   WriteNewDataFiles took %lld ms\n",
+		        std::chrono::duration_cast<std::chrono::milliseconds>(after_write_data_files - after_get_data_files).count());
 		batch_queries += metadata_manager->WriteNewInlinedData(commit_snapshot, result.new_inlined_data,
 		                                                       new_tables_result, new_inlined_data_tables_result);
 	}
@@ -1839,16 +1856,44 @@ void DuckLakeTransaction::FlushChanges() {
 			}
 			can_retry = true;
 			DuckLakeCommitState commit_state(commit_snapshot);
+			
+			// Timing instrumentation for commit phase
+			auto commit_start = std::chrono::steady_clock::now();
+			
 			// write the new snapshot
 			string batch_queries = metadata_manager->InsertSnapshot();
+			
+			auto before_commit_changes = std::chrono::steady_clock::now();
 			batch_queries += CommitChanges(commit_state, transaction_changes, stats);
+			auto after_commit_changes = std::chrono::steady_clock::now();
+			fprintf(stderr, "[DuckLake Commit] CommitChanges (build queries) took %lld ms\n",
+			        std::chrono::duration_cast<std::chrono::milliseconds>(after_commit_changes - before_commit_changes).count());
 
 			batch_queries += WriteSnapshotChanges(commit_state, transaction_changes);
+			auto after_write_snapshot = std::chrono::steady_clock::now();
+			fprintf(stderr, "[DuckLake Commit] WriteSnapshotChanges took %lld ms\n",
+			        std::chrono::duration_cast<std::chrono::milliseconds>(after_write_snapshot - after_commit_changes).count());
+			fprintf(stderr, "[DuckLake Commit] Total query string size: %llu bytes\n",
+			        (unsigned long long)batch_queries.size());
+			
+			auto before_execute = std::chrono::steady_clock::now();
 			auto res = metadata_manager->Execute(commit_snapshot, batch_queries);
+			auto after_execute = std::chrono::steady_clock::now();
+			fprintf(stderr, "[DuckLake Commit] SQL execution took %lld ms\n",
+			        std::chrono::duration_cast<std::chrono::milliseconds>(after_execute - before_execute).count());
+			
 			if (res->HasError()) {
 				res->GetErrorObject().Throw("Failed to flush changes into DuckLake: ");
 			}
+			
+			auto before_db_commit = std::chrono::steady_clock::now();
 			connection->Commit();
+			auto after_db_commit = std::chrono::steady_clock::now();
+			fprintf(stderr, "[DuckLake Commit] DB commit took %lld ms\n",
+			        std::chrono::duration_cast<std::chrono::milliseconds>(after_db_commit - before_db_commit).count());
+			fprintf(stderr, "[DuckLake Commit] Total commit time: %lld ms\n",
+			        std::chrono::duration_cast<std::chrono::milliseconds>(after_db_commit - commit_start).count());
+			
 			catalog_version = commit_snapshot.schema_version;
 
 			// finished writing
