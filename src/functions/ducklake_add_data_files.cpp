@@ -9,6 +9,7 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "storage/ducklake_geo_stats.hpp"
+#include <iostream>
 
 namespace duckdb {
 
@@ -1247,16 +1248,21 @@ DuckLakeDataFile DuckLakeFileProcessor::AddFileToTable(ParquetFileMetadata &file
 vector<DuckLakeDataFile> DuckLakeFileProcessor::AddFiles(const vector<string> &globs) {
 	// fetch the metadata, stats and columns from the various files
 	for (auto &glob : globs) {
+		std::cout << "[MEMORY DEBUG] Before ReadParquetFullMetadata for glob: " << glob << std::endl;
 		ReadParquetFullMetadata(glob);
+		std::cout << "[MEMORY DEBUG] After ReadParquetFullMetadata for glob: " << glob << ", parquet_files count: " << parquet_files.size() << std::endl;
 	}
 
 	// now we have obtained a list of files to add together with the relevant information (statistics, file size, ...)
 	// we need to create a mapping from the columns in the file to the columns in the table
 	vector<DuckLakeDataFile> written_files;
+	idx_t file_idx = 0;
 	for (auto &entry : parquet_files) {
 		auto file = AddFileToTable(*entry.second);
 		// File being called by 'add files' is not created by ducklake
 		file.created_by_ducklake = false;
+		std::cout << "[MEMORY DEBUG] After AddFileToTable [" << file_idx << "/" << parquet_files.size() << "]: " << entry.first << std::endl;
+		file_idx++;
 		if (file.row_count == 0) {
 			// skip adding empty files
 			continue;
