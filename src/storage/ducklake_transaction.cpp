@@ -18,6 +18,7 @@
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction_changes.hpp"
 #include "storage/ducklake_transaction_manager.hpp"
+#include <iostream>
 #include "storage/ducklake_view_entry.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/settings.hpp"
@@ -1354,15 +1355,23 @@ NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCo
 	// get the global table stats
 	DuckLakeNewGlobalStats new_globals;
 	unique_ptr<DuckLakeStats> dl_stats;
+
+	auto init_start = std::chrono::steady_clock::now();
 	if (stats) {
 		auto &schema = ducklake_catalog.GetSchemaForSnapshot(*this, GetSnapshot());
 		dl_stats = ducklake_catalog.ConstructStatsMap(*stats, schema);
 	}
+	auto init_end = std::chrono::steady_clock::now();
+	fprintf(stderr, "[DuckLake Commit]     Init (ConstructStatsMap): %lld ms\n",
+	        std::chrono::duration_cast<std::chrono::milliseconds>(init_end - init_start).count());
 
 	// Timing counters
 	int64_t time_get_new_data_file = 0;
 	int64_t time_merge_stats = 0;
 	int64_t time_push_back = 0;
+	int64_t time_get_table_stats = 0;
+	int64_t time_copy_stats = 0;
+	int64_t time_update_global_stats = 0;
 
 	for (auto &entry : table_data_changes) {
 		auto table_id = commit_state.GetTableId(entry.first);
@@ -1381,6 +1390,7 @@ NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCo
 		// get the global table stats
 		DuckLakeNewGlobalStats new_globals;
 		optional_ptr<DuckLakeTableStats> current_stats;
+		auto ts1 = std::chrono::steady_clock::now();
 		if (dl_stats) {
 			auto dl_stats_entry = dl_stats->table_stats.find(table_id);
 			if (dl_stats_entry != dl_stats->table_stats.end()) {
@@ -1389,11 +1399,16 @@ NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCo
 		} else {
 			current_stats = ducklake_catalog.GetTableStats(*this, table_id);
 		}
+		auto ts2 = std::chrono::steady_clock::now();
+		time_get_table_stats += std::chrono::duration_cast<std::chrono::microseconds>(ts2 - ts1).count();
 
 		if (current_stats) {
 			new_globals.stats = *current_stats;
 			new_globals.initialized = true;
 		}
+		auto ts3 = std::chrono::steady_clock::now();
+		time_copy_stats += std::chrono::duration_cast<std::chrono::microseconds>(ts3 - ts2).count();
+
 		auto &new_stats = new_globals.stats;
 		vector<DuckLakeDeleteFile> delete_files;
 		for (auto &file : table_changes.new_data_files) {
@@ -1464,11 +1479,16 @@ NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCo
 			}
 		}
 		// update the global stats for this table based on the newly written data
+		auto ugs_start = std::chrono::steady_clock::now();
 		batch_query += UpdateGlobalTableStats(table_id, new_globals);
+		auto ugs_end = std::chrono::steady_clock::now();
+		time_update_global_stats += std::chrono::duration_cast<std::chrono::microseconds>(ugs_end - ugs_start).count();
 	}
 
 	fprintf(stderr, "[DuckLake Commit]     GetNewDataFile: %lld ms, MergeStats: %lld ms, push_back: %lld ms\n",
 	        time_get_new_data_file / 1000, time_merge_stats / 1000, time_push_back / 1000);
+	fprintf(stderr, "[DuckLake Commit]     GetTableStats: %lld ms, CopyStats: %lld ms, UpdateGlobalStats: %lld ms\n",
+	        time_get_table_stats / 1000, time_copy_stats / 1000, time_update_global_stats / 1000);
 
 	return result;
 }
@@ -2139,14 +2159,18 @@ void DuckLakeTransaction::DropTransactionLocalFile(TableIndex table_id, const st
 }
 
 void DuckLakeTransaction::AppendFiles(TableIndex table_id, vector<DuckLakeDataFile> files) {
+	std::cout << "[MEMORY DEBUG]   AppendFiles: Starting with " << files.size() << " files" << std::endl;
 	if (files.empty()) {
 		return;
 	}
 	lock_guard<mutex> guard(table_data_changes_lock);
+	std::cout << "[MEMORY DEBUG]   AppendFiles: Acquired lock, getting table_changes" << std::endl;
 	auto &table_changes = table_data_changes[table_id];
+	std::cout << "[MEMORY DEBUG]   AppendFiles: Current new_data_files size: " << table_changes.new_data_files.size() << std::endl;
 	for (auto &file : files) {
 		table_changes.new_data_files.push_back(std::move(file));
 	}
+	std::cout << "[MEMORY DEBUG]   AppendFiles: Final new_data_files size: " << table_changes.new_data_files.size() << std::endl;
 }
 
 void DuckLakeTransaction::AppendInlinedData(TableIndex table_id, unique_ptr<DuckLakeInlinedData> new_data) {

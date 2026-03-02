@@ -162,6 +162,7 @@ private:
 };
 
 void DuckLakeFileProcessor::ReadParquetFullMetadata(const string &glob) {
+	std::cout << "[MEMORY DEBUG]   ReadParquetFullMetadata: Starting query for glob: " << glob << std::endl;
 	auto result = transaction.Query(StringUtil::Format(R"(
 SELECT 
     list_transform(parquet_file_metadata, x -> struct_pack(
@@ -193,10 +194,12 @@ SELECT
 FROM parquet_full_metadata(%s)
 )",
 	                                                   SQLString(glob)));
+	std::cout << "[MEMORY DEBUG]   ReadParquetFullMetadata: Query completed" << std::endl;
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to add data files to DuckLake: ");
 	}
 
+	idx_t row_count_processed = 0;
 	for (auto &row : *result) {
 		auto &chunk = row.GetChunk();
 		idx_t row_idx = row.GetRowInChunk();
@@ -356,6 +359,10 @@ FROM parquet_full_metadata(%s)
 		}
 
 		DetermineMapping(file);
+		row_count_processed++;
+		if (row_count_processed % 100 == 0) {
+			std::cout << "[MEMORY DEBUG]   ReadParquetFullMetadata: Processed " << row_count_processed << " files, current: " << filename << std::endl;
+		}
 
 		auto &metadata_struct_children = StructVector::GetEntries(parquet_metadata_list_entries);
 		auto &column_id_vec = *metadata_struct_children[0];
@@ -485,6 +492,7 @@ FROM parquet_full_metadata(%s)
 			column.column_stats.push_back(std::move(stats));
 		}
 	}
+	std::cout << "[MEMORY DEBUG]   ReadParquetFullMetadata: Finished processing " << row_count_processed << " files total" << std::endl;
 }
 
 class DuckLakeParquetTypeChecker {
@@ -1261,7 +1269,6 @@ vector<DuckLakeDataFile> DuckLakeFileProcessor::AddFiles(const vector<string> &g
 		auto file = AddFileToTable(*entry.second);
 		// File being called by 'add files' is not created by ducklake
 		file.created_by_ducklake = false;
-		std::cout << "[MEMORY DEBUG] After AddFileToTable [" << file_idx << "/" << parquet_files.size() << "]: " << entry.first << std::endl;
 		file_idx++;
 		if (file.row_count == 0) {
 			// skip adding empty files
@@ -1282,8 +1289,10 @@ static void DuckLakeAddDataFilesExecute(ClientContext &context, TableFunctionInp
 	}
 	DuckLakeFileProcessor processor(transaction, bind_data);
 	auto files_to_add = processor.AddFiles(bind_data.globs);
+	std::cout << "[MEMORY DEBUG] Before AppendFiles, files count: " << files_to_add.size() << std::endl;
 	// add the files
 	transaction.AppendFiles(bind_data.table.GetTableId(), std::move(files_to_add));
+	std::cout << "[MEMORY DEBUG] After AppendFiles" << std::endl;
 	state.finished = true;
 }
 
