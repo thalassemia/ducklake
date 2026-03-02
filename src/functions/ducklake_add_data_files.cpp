@@ -9,6 +9,7 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "storage/ducklake_geo_stats.hpp"
+#include <atomic>
 
 namespace duckdb {
 
@@ -76,16 +77,125 @@ static unique_ptr<FunctionData> DuckLakeAddDataFilesBind(ClientContext &context,
 	return std::move(result);
 }
 
+// Result structure that includes both the file and its name map
+struct DuckLakeFileWithMapping {
+	DuckLakeDataFile file;
+	unique_ptr<DuckLakeNameMap> name_map;
+};
+
 struct DuckLakeAddDataFilesState : public GlobalTableFunctionState {
-	DuckLakeAddDataFilesState() {
+	DuckLakeAddDataFilesState(ClientContext &context, const vector<string> &globs) {
+		// Expand all globs to get the list of files
+		auto &fs = FileSystem::GetFileSystem(context);
+		for (auto &glob : globs) {
+			auto expanded = fs.GlobFiles(glob, FileGlobOptions::ALLOW_EMPTY);
+			for (auto &file : expanded) {
+				files.push_back(file.path);
+			}
+		}
+		total_files = files.size();
+
+		// Determine max threads based on number of files
+		auto scheduler_threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
+		if (total_files > 1) {
+			max_threads = MinValue<idx_t>(total_files, scheduler_threads);
+		} else {
+			max_threads = 1;
+		}
+		fprintf(stderr, "[DuckLake AddFiles] Global init: total_files=%llu, scheduler_threads=%llu, max_threads=%llu\n",
+		        (unsigned long long)total_files, (unsigned long long)scheduler_threads, (unsigned long long)max_threads);
 	}
 
-	bool finished = false;
+	idx_t MaxThreads() const override {
+		return max_threads;
+	}
+
+	bool NextFile(string &result) {
+		// Use atomic fetch_add to claim a file index without locking
+		// The files vector is read-only after construction, so we can safely read from it
+		idx_t my_idx = current_file_idx.fetch_add(1);
+		if (my_idx >= files.size()) {
+			return false;
+		}
+		result = files[my_idx];  // Copy instead of move since vector is shared
+		return true;
+	}
+
+	void AddProcessedFile(DuckLakeFileWithMapping file_with_map) {
+		// This lock is necessary for vector push_back (not thread-safe)
+		// but contention is low since actual work (file processing) is outside lock
+		lock_guard<mutex> guard(result_lock);
+		processed_files_with_maps.push_back(std::move(file_with_map));
+	}
+
+	vector<DuckLakeFileWithMapping> GetProcessedFiles() {
+		// Only called once during finalization, lock is fine
+		lock_guard<mutex> guard(result_lock);
+		return std::move(processed_files_with_maps);
+	}
+
+	void MarkFileCompleted() {
+		// Atomic increment - no lock needed
+		files_completed.fetch_add(1);
+	}
+
+	bool ShouldFinalize() {
+		// Use compare_exchange to atomically check and set finalized flag
+		// This ensures exactly one thread performs finalization
+		if (files_completed.load() < total_files) {
+			return false;
+		}
+		bool expected = false;
+		return finalized.compare_exchange_strong(expected, true);
+	}
+
+	mutex result_lock;  // Only lock needed - for processed_files vector
+	vector<string> files;  // Read-only after construction
+	std::atomic<idx_t> current_file_idx{0};
+	idx_t total_files = 0;
+	std::atomic<idx_t> files_completed{0};
+	idx_t max_threads = 1;
+	std::atomic<bool> finalized{false};
+	vector<DuckLakeFileWithMapping> processed_files_with_maps;
+	std::atomic<idx_t> next_thread_id{0};
+};
+
+struct DuckLakeAddDataFilesLocalState : public LocalTableFunctionState {
+	DuckLakeAddDataFilesLocalState(ClientContext &context, DuckLakeTransaction &transaction,
+	                               const DuckLakeAddDataFilesData &bind_data, idx_t thread_id)
+	    : transaction(transaction), processor(make_uniq<DuckLakeFileProcessor>(transaction, bind_data)),
+	      thread_id(thread_id) {
+		// Create a thread-local connection for parallel metadata reading
+		// This avoids serialization on the shared transaction connection lock
+		connection = make_uniq<Connection>(*context.db);
+		fprintf(stderr, "[DuckLake AddFiles] InitLocal: thread_id=%llu initialized\n", (unsigned long long)thread_id);
+	}
+
+	DuckLakeTransaction &transaction;
+	unique_ptr<Connection> connection;
+	unique_ptr<DuckLakeFileProcessor> processor;
+	idx_t thread_id;
+	idx_t files_processed = 0;
 };
 
 static unique_ptr<GlobalTableFunctionState> DuckLakeAddDataFilesInit(ClientContext &context,
                                                                      TableFunctionInitInput &input) {
-	return make_uniq<DuckLakeAddDataFilesState>();
+	auto &bind_data = input.bind_data->Cast<DuckLakeAddDataFilesData>();
+	return make_uniq<DuckLakeAddDataFilesState>(context, bind_data.globs);
+}
+
+static unique_ptr<LocalTableFunctionState> DuckLakeAddDataFilesInitLocal(ExecutionContext &context,
+                                                                          TableFunctionInitInput &input,
+                                                                          GlobalTableFunctionState *global_state) {
+	auto &bind_data = input.bind_data->Cast<DuckLakeAddDataFilesData>();
+	auto &gstate = global_state->Cast<DuckLakeAddDataFilesState>();
+	
+	// Assign a unique thread ID for logging
+	idx_t thread_id = gstate.next_thread_id.fetch_add(1);
+	
+	// Get the transaction once per thread, not per file
+	auto &transaction = DuckLakeTransaction::Get(context.client, bind_data.catalog);
+	return make_uniq<DuckLakeAddDataFilesLocalState>(context.client, transaction, bind_data, thread_id);
 }
 
 struct ParquetColumn {
@@ -132,10 +242,11 @@ public:
 	}
 
 	vector<DuckLakeDataFile> AddFiles(const vector<string> &globs);
+	DuckLakeFileWithMapping ProcessSingleFile(const string &file_path, Connection *thread_connection = nullptr);
 
 private:
-	void ReadParquetFullMetadata(const string &glob);
-	DuckLakeDataFile AddFileToTable(ParquetFileMetadata &file);
+	void ReadParquetFullMetadata(const string &glob, Connection *thread_connection = nullptr);
+	DuckLakeFileWithMapping AddFileToTable(ParquetFileMetadata &file);
 	unique_ptr<DuckLakeNameMapEntry> MapColumn(ParquetFileMetadata &file_metadata, ParquetColumn &column,
 	                                           const DuckLakeFieldId &field_id, string prefix);
 	vector<unique_ptr<DuckLakeNameMapEntry>> MapColumns(ParquetFileMetadata &file,
@@ -160,8 +271,11 @@ private:
 	unordered_map<string, unique_ptr<ParquetFileMetadata>> parquet_files;
 };
 
-void DuckLakeFileProcessor::ReadParquetFullMetadata(const string &glob) {
-	auto result = transaction.Query(StringUtil::Format(R"(
+void DuckLakeFileProcessor::ReadParquetFullMetadata(const string &glob, Connection *thread_connection) {
+	// Use thread-local connection for parallel metadata reading if provided
+	// This avoids serialization on the shared transaction connection lock
+	auto result = thread_connection ?
+		thread_connection->Query(StringUtil::Format(R"(
 SELECT 
     list_transform(parquet_file_metadata, x -> struct_pack(
         file_name := x.file_name,
@@ -186,6 +300,37 @@ SELECT
         converted_type := x.converted_type,
         "scale" := x."scale",
         "precision" := x."precision",
+        field_id := x.field_id,
+        logical_type := x.logical_type
+    )) AS parquet_schema
+FROM parquet_full_metadata(%s)
+)",
+	                                                   SQLString(glob)))
+	: transaction.Query(StringUtil::Format(R"(
+SELECT 
+    list_transform(parquet_file_metadata, x -> struct_pack(
+        file_name := x.file_name,
+        num_rows := x.num_rows,
+        file_size_bytes := x.file_size_bytes,
+        footer_size := x.footer_size
+    )) AS parquet_file_metadata,
+    list_transform(parquet_metadata, x -> struct_pack(
+        column_id := x.column_id,
+        stats_min := COALESCE(x.stats_min, x.stats_min_value),
+        stats_max := COALESCE(x.stats_max, x.stats_max_value),
+        stats_null_count := x.stats_null_count,
+		stats_num_values := x.num_values,
+        total_compressed_size := x.total_compressed_size,
+        geo_bbox := x.geo_bbox,
+        geo_types := x.geo_types
+    )) AS parquet_metadata,
+    list_transform(parquet_schema, x -> struct_pack(
+        \"name\" := x.\"name\",
+        \"type\" := x.\"type\",
+        num_children := x.num_children,
+        converted_type := x.converted_type,
+        \"scale\" := x.\"scale\",
+        \"precision\" := x.\"precision\",
         field_id := x.field_id,
         logical_type := x.logical_type
     )) AS parquet_schema
@@ -1150,20 +1295,21 @@ void DuckLakeFileProcessor::DetermineMapping(ParquetFileMetadata &file) {
 	file.map_entries = MapColumns(file, file.columns, table.GetFieldData().GetFieldIds());
 }
 
-DuckLakeDataFile DuckLakeFileProcessor::AddFileToTable(ParquetFileMetadata &file) {
-	DuckLakeDataFile result;
-	result.file_name = file.filename;
-	result.row_count = file.row_count.GetIndex();
-	result.file_size_bytes = file.file_size_bytes.GetIndex();
-	result.footer_size = file.footer_size.GetIndex();
+DuckLakeFileWithMapping DuckLakeFileProcessor::AddFileToTable(ParquetFileMetadata &file) {
+	DuckLakeFileWithMapping result;
+	result.file.file_name = file.filename;
+	result.file.row_count = file.row_count.GetIndex();
+	result.file.file_size_bytes = file.file_size_bytes.GetIndex();
+	result.file.footer_size = file.footer_size.GetIndex();
 
 	auto name_map = make_uniq<DuckLakeNameMap>();
 	name_map->table_id = table.GetTableId();
-	MapColumnStats(file, result);
+	MapColumnStats(file, result.file);
 	name_map->column_maps = std::move(file.map_entries);
 
-	// we successfully mapped this file - register the name map and refer to it in the file
-	result.mapping_id = transaction.AddNameMap(std::move(name_map));
+	// Don't add name map to transaction yet - defer to finalization phase
+	// This avoids serialization on the shared transaction object
+	result.name_map = std::move(name_map);
 
 	const auto partition_data = table.GetPartitionData().get();
 	if (partition_data) {
@@ -1194,10 +1340,10 @@ DuckLakeDataFile DuckLakeFileProcessor::AddFileToTable(ParquetFileMetadata &file
 			field_partition_key_map[partition_fields.field_id.index] = partition_fields.partition_key_index;
 		}
 		for (auto &hive_partition : file.hive_partition_values) {
-			result.partition_values.push_back({field_partition_key_map[hive_partition.field_index.index],
+			result.file.partition_values.push_back({field_partition_key_map[hive_partition.field_index.index],
 			                                   hive_partition.hive_value.GetValue<string>()});
 		}
-		result.partition_id = partition_data->partition_id;
+		result.file.partition_id = partition_data->partition_id;
 	}
 	return result;
 }
@@ -1212,31 +1358,110 @@ vector<DuckLakeDataFile> DuckLakeFileProcessor::AddFiles(const vector<string> &g
 	// we need to create a mapping from the columns in the file to the columns in the table
 	vector<DuckLakeDataFile> written_files;
 	for (auto &entry : parquet_files) {
-		auto file = AddFileToTable(*entry.second);
+		auto file_result = AddFileToTable(*entry.second);
 		// File being called by 'add files' is not created by ducklake
-		file.created_by_ducklake = false;
-		if (file.row_count == 0) {
+		file_result.file.created_by_ducklake = false;
+		if (file_result.file.row_count == 0) {
 			// skip adding empty files
 			continue;
 		}
-		written_files.push_back(std::move(file));
+		// For non-parallel execution path, add name map directly to transaction
+		file_result.file.mapping_id = transaction.AddNameMap(std::move(file_result.name_map));
+		written_files.push_back(std::move(file_result.file));
 	}
 	return written_files;
 }
 
-static void DuckLakeAddDataFilesExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &state = data_p.global_state->Cast<DuckLakeAddDataFilesState>();
-	auto &bind_data = data_p.bind_data->Cast<DuckLakeAddDataFilesData>();
-	auto &transaction = DuckLakeTransaction::Get(context, bind_data.catalog);
+DuckLakeFileWithMapping DuckLakeFileProcessor::ProcessSingleFile(const string &file_path, Connection *thread_connection) {
+	// Process a single file (used for parallel execution)
+	// Clear any previous state since processor is reused per thread
+	parquet_files.clear();
+	
+	// Use thread-local connection for parallel metadata reading
+	ReadParquetFullMetadata(file_path, thread_connection);
 
-	if (state.finished) {
-		return;
+	// There should be exactly one file in parquet_files
+	if (parquet_files.empty()) {
+		throw InternalException("No file metadata returned for %s", file_path);
 	}
-	DuckLakeFileProcessor processor(transaction, bind_data);
-	auto files_to_add = processor.AddFiles(bind_data.globs);
-	// add the files
-	transaction.AppendFiles(bind_data.table.GetTableId(), std::move(files_to_add));
-	state.finished = true;
+
+	auto &entry = *parquet_files.begin();
+	auto result = AddFileToTable(*entry.second);
+	// File being called by 'add files' is not created by ducklake
+	result.file.created_by_ducklake = false;
+	return result;
+}
+
+static void DuckLakeAddDataFilesExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &global_state = data_p.global_state->Cast<DuckLakeAddDataFilesState>();
+	auto &local_state = data_p.local_state->Cast<DuckLakeAddDataFilesLocalState>();
+	auto &bind_data = data_p.bind_data->Cast<DuckLakeAddDataFilesData>();
+	
+	fprintf(stderr, "[DuckLake AddFiles] Execute called: thread_id=%llu, files_processed_by_thread=%llu\n",
+	        (unsigned long long)local_state.thread_id, (unsigned long long)local_state.files_processed);
+	
+	idx_t output_count = 0;
+	
+	// Limit files per Execute call to give scheduler opportunity to spawn more threads
+	// Each Execute call should return relatively quickly to allow pipeline interleaving
+	constexpr idx_t MAX_FILES_PER_EXECUTE = 8;
+	idx_t files_this_call = 0;
+	
+	// Keep processing files until we hit limits or run out of files
+	while (output_count < STANDARD_VECTOR_SIZE && files_this_call < MAX_FILES_PER_EXECUTE) {
+		string file_path;
+		if (!global_state.NextFile(file_path)) {
+			// No more files to process - check if we should finalize
+			fprintf(stderr, "[DuckLake AddFiles] Thread %llu: no more files, checking finalization\n",
+			        (unsigned long long)local_state.thread_id);
+			if (global_state.ShouldFinalize()) {
+				fprintf(stderr, "[DuckLake AddFiles] Thread %llu: performing finalization\n",
+				        (unsigned long long)local_state.thread_id);
+				// Get transaction for finalization (serialized, but happens once)
+				auto &transaction = local_state.transaction;
+				auto files_with_maps = global_state.GetProcessedFiles();
+				if (!files_with_maps.empty()) {
+					// Add all name maps to the transaction and update mapping_ids
+					vector<DuckLakeDataFile> files_to_add;
+					files_to_add.reserve(files_with_maps.size());
+					for (auto &file_with_map : files_with_maps) {
+						// Add the name map to the transaction (serialized, but batched)
+						file_with_map.file.mapping_id = transaction.AddNameMap(std::move(file_with_map.name_map));
+						files_to_add.push_back(std::move(file_with_map.file));
+					}
+					transaction.AppendFiles(bind_data.table.GetTableId(), std::move(files_to_add));
+					fprintf(stderr, "[DuckLake AddFiles] Finalization complete: added %llu files to transaction\n",
+					        (unsigned long long)files_to_add.size());
+				}
+			}
+			break; // Exit loop, no more files
+		}
+
+		fprintf(stderr, "[DuckLake AddFiles] Thread %llu: processing file '%s'\n",
+		        (unsigned long long)local_state.thread_id, file_path.c_str());
+		
+		// Process one file
+		auto result = local_state.processor->ProcessSingleFile(file_path, local_state.connection.get());
+		local_state.files_processed++;
+		files_this_call++;
+
+		if (result.file.row_count > 0) {
+			// Output the filename
+			output.data[0].SetValue(output_count, Value(result.file.file_name));
+			output_count++;
+			
+			// CRITICAL: Add processed file BEFORE marking file completed
+			// This prevents race where another thread finalizes before all files are added
+			global_state.AddProcessedFile(std::move(result));
+		}
+		// Mark file completed AFTER adding to processed files (or skipping if empty)
+		global_state.MarkFileCompleted();
+	}
+	
+	fprintf(stderr, "[DuckLake AddFiles] Thread %llu: Execute returning with %llu rows\n",
+	        (unsigned long long)local_state.thread_id, (unsigned long long)output_count);
+	
+	output.SetCardinality(output_count);
 }
 
 TableFunctionSet DuckLakeAddDataFilesFunction::GetFunctions() {
@@ -1244,7 +1469,8 @@ TableFunctionSet DuckLakeAddDataFilesFunction::GetFunctions() {
 	vector<LogicalType> at_types {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)};
 	for (auto &type : at_types) {
 		TableFunction function("ducklake_add_data_files", {LogicalType::VARCHAR, LogicalType::VARCHAR, type},
-		                       DuckLakeAddDataFilesExecute, DuckLakeAddDataFilesBind, DuckLakeAddDataFilesInit);
+		                       DuckLakeAddDataFilesExecute, DuckLakeAddDataFilesBind, DuckLakeAddDataFilesInit,
+		                       DuckLakeAddDataFilesInitLocal);
 		function.named_parameters["allow_missing"] = LogicalType::BOOLEAN;
 		function.named_parameters["ignore_extra_columns"] = LogicalType::BOOLEAN;
 		function.named_parameters["hive_partitioning"] = LogicalType::BOOLEAN;
