@@ -2817,6 +2817,15 @@ string DuckLakeMetadataManager::FromRelativePath(TableIndex table_id, const Duck
 	return FromRelativePath(path, GetPath(table_id, {}, {}));
 }
 
+// Helper to flush accumulated VALUES and reset the accumulator
+static void FlushBatchInsert(string &batch_query, string &values_accumulator, const string &table_name, idx_t &count) {
+	if (count > 0) {
+		batch_query += "INSERT INTO {METADATA_CATALOG}." + table_name + " VALUES " + values_accumulator + ";";
+		values_accumulator.clear();
+		count = 0;
+	}
+}
+
 string DuckLakeMetadataManager::WriteNewDataFiles(const vector<DuckLakeFileInfo> &new_files,
                                                   const vector<DuckLakeTableInfo> &new_tables,
                                                   vector<DuckLakeSchemaInfo> &new_schemas_result) {
@@ -2824,14 +2833,29 @@ string DuckLakeMetadataManager::WriteNewDataFiles(const vector<DuckLakeFileInfo>
 	if (new_files.empty()) {
 		return batch_query;
 	}
-	string data_file_insert_query;
-	string column_stats_insert_query;
-	string variant_stats_insert_query;
-	string partition_insert_query;
+	
+	// Batch size for INSERT statements - reduces parser memory usage
+	constexpr idx_t BATCH_SIZE = 1000;
+	
+	// Pre-reserve capacity to avoid O(n²) string copying
+	batch_query.reserve(new_files.size() * 500);  // Rough estimate per file
+	
+	string data_file_values;
+	string column_stats_values;
+	string variant_stats_values;
+	string partition_values;
+	
+	data_file_values.reserve(BATCH_SIZE * 300);
+	column_stats_values.reserve(BATCH_SIZE * 150);
+	
+	idx_t data_file_count = 0;
+	idx_t column_stats_count = 0;
+	idx_t variant_stats_count = 0;
+	idx_t partition_count = 0;
 
 	for (auto &file : new_files) {
-		if (!data_file_insert_query.empty()) {
-			data_file_insert_query += ",";
+		if (data_file_count > 0) {
+			data_file_values += ",";
 		}
 		auto row_id = file.row_id_start.IsValid() ? to_string(file.row_id_start.GetIndex()) : "NULL";
 		auto partition_id = file.partition_id.IsValid() ? to_string(file.partition_id.GetIndex()) : "NULL";
@@ -2846,64 +2870,76 @@ string DuckLakeMetadataManager::WriteNewDataFiles(const vector<DuckLakeFileInfo>
 		string footer_size = file.footer_size.IsValid() ? to_string(file.footer_size.GetIndex()) : "NULL";
 		string mapping = file.mapping_id.IsValid() ? to_string(file.mapping_id.index) : "NULL";
 		auto path = GetRelativePath(file.table_id, file.file_name, new_tables, new_schemas_result);
-		data_file_insert_query += StringUtil::Format(
+		data_file_values += StringUtil::Format(
 		    "(%d, %d, %s, NULL, NULL, %s, %s, 'parquet', %d, %d, %s, %s, %s, %s, %s, %s)", data_file_index, table_id,
 		    begin_snapshot, SQLString(path.path), path.path_is_relative ? "true" : "false", file.row_count,
 		    file.file_size_bytes, footer_size, row_id, partition_id, encryption_key, mapping, partial_max);
+		data_file_count++;
+		
+		// Flush data file batch if needed
+		if (data_file_count >= BATCH_SIZE) {
+			FlushBatchInsert(batch_query, data_file_values, "ducklake_data_file", data_file_count);
+			data_file_values.reserve(BATCH_SIZE * 300);
+		}
+		
 		for (auto &column_stats : file.column_stats) {
-			if (!column_stats_insert_query.empty()) {
-				column_stats_insert_query += ",";
+			if (column_stats_count > 0) {
+				column_stats_values += ",";
 			}
 			auto column_id = column_stats.column_id.index;
-			column_stats_insert_query += StringUtil::Format(
+			column_stats_values += StringUtil::Format(
 			    "(%d, %d, %d, %s, %s, %s, %s, %s, %s, %s)", data_file_index, table_id, column_id,
 			    column_stats.column_size_bytes, column_stats.value_count, column_stats.null_count, column_stats.min_val,
 			    column_stats.max_val, column_stats.contains_nan, column_stats.extra_stats);
+			column_stats_count++;
+			
+			// Flush column stats batch if needed
+			if (column_stats_count >= BATCH_SIZE) {
+				FlushBatchInsert(batch_query, column_stats_values, "ducklake_file_column_stats", column_stats_count);
+				column_stats_values.reserve(BATCH_SIZE * 150);
+			}
+			
 			for (auto &variant_stats : column_stats.variant_stats) {
-				if (!variant_stats_insert_query.empty()) {
-					variant_stats_insert_query += ",";
+				if (variant_stats_count > 0) {
+					variant_stats_values += ",";
 				}
 				auto &field_stats = variant_stats.field_stats;
-				variant_stats_insert_query += StringUtil::Format(
+				variant_stats_values += StringUtil::Format(
 				    "(%d, %d, %d, %s, %s, %s, %s, %s, %s, %s, %s, %s)", data_file_index, table_id, column_id,
 				    SQLString(variant_stats.field_name), SQLString(variant_stats.shredded_type),
 				    field_stats.column_size_bytes, field_stats.value_count, field_stats.null_count, field_stats.min_val,
 				    field_stats.max_val, field_stats.contains_nan, field_stats.extra_stats);
+				variant_stats_count++;
+				
+				if (variant_stats_count >= BATCH_SIZE) {
+					FlushBatchInsert(batch_query, variant_stats_values, "ducklake_file_variant_stats", variant_stats_count);
+				}
 			}
 		}
 		if (file.partition_id.IsValid() == file.partition_values.empty()) {
 			throw InternalException("File should either not be partitioned, or have partition values");
 		}
 		for (auto &part_val : file.partition_values) {
-			if (!partition_insert_query.empty()) {
-				partition_insert_query += ",";
+			if (partition_count > 0) {
+				partition_values += ",";
 			}
-			partition_insert_query +=
+			partition_values +=
 			    StringUtil::Format("(%d, %d, %d, %s)", data_file_index, table_id, part_val.partition_column_idx,
 			                       SQLString(part_val.partition_value));
+			partition_count++;
+			
+			if (partition_count >= BATCH_SIZE) {
+				FlushBatchInsert(batch_query, partition_values, "ducklake_file_partition_value", partition_count);
+			}
 		}
 	}
-	if (data_file_insert_query.empty()) {
-		throw InternalException("No files found!?");
-	}
+	
+	// Flush remaining data
+	FlushBatchInsert(batch_query, data_file_values, "ducklake_data_file", data_file_count);
+	FlushBatchInsert(batch_query, column_stats_values, "ducklake_file_column_stats", column_stats_count);
+	FlushBatchInsert(batch_query, partition_values, "ducklake_file_partition_value", partition_count);
+	FlushBatchInsert(batch_query, variant_stats_values, "ducklake_file_variant_stats", variant_stats_count);
 
-	// insert the data files
-	batch_query +=
-	    StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_data_file VALUES %s;", data_file_insert_query);
-
-	// insert the column stats
-	batch_query += StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_file_column_stats VALUES %s;",
-	                                  column_stats_insert_query);
-
-	if (!partition_insert_query.empty()) {
-		// insert the partition values
-		batch_query += StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_file_partition_value VALUES %s;",
-		                                  partition_insert_query);
-	}
-	if (!variant_stats_insert_query.empty()) {
-		batch_query += StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_file_variant_stats VALUES %s;",
-		                                  variant_stats_insert_query);
-	}
 	return batch_query;
 }
 
@@ -3019,31 +3055,62 @@ ORDER BY mapping_id, parent_column NULLS FIRST
 }
 
 string DuckLakeMetadataManager::WriteNewColumnMappings(const vector<DuckLakeColumnMappingInfo> &new_column_mappings) {
-	string column_mapping_insert_query;
-	string name_map_insert_query;
+	if (new_column_mappings.empty()) {
+		return "";
+	}
+	
+	constexpr idx_t BATCH_SIZE = 1000;
+	string batch_query;
+	batch_query.reserve(new_column_mappings.size() * 200);
+	
+	string column_mapping_values;
+	string name_map_values;
+	idx_t column_mapping_count = 0;
+	idx_t name_map_count = 0;
+	
 	for (auto &column_mapping : new_column_mappings) {
-		if (!column_mapping_insert_query.empty()) {
-			column_mapping_insert_query += ", ";
+		if (column_mapping_count > 0) {
+			column_mapping_values += ", ";
 		}
-		column_mapping_insert_query +=
+		column_mapping_values +=
 		    StringUtil::Format("(%d, %d, %s)", column_mapping.mapping_id.index, column_mapping.table_id.index,
 		                       SQLString(column_mapping.map_type));
+		column_mapping_count++;
+		
+		if (column_mapping_count >= BATCH_SIZE) {
+			batch_query += "INSERT INTO {METADATA_CATALOG}.ducklake_column_mapping VALUES " + column_mapping_values + ";";
+			column_mapping_values.clear();
+			column_mapping_count = 0;
+		}
+		
 		for (auto &name_map_column : column_mapping.map_columns) {
-			if (!name_map_insert_query.empty()) {
-				name_map_insert_query += ", ";
+			if (name_map_count > 0) {
+				name_map_values += ", ";
 			}
 			string parent_column =
 			    name_map_column.parent_column.IsValid() ? to_string(name_map_column.parent_column.GetIndex()) : "NULL";
 			string is_partition = name_map_column.hive_partition ? "true" : "false";
-			name_map_insert_query +=
+			name_map_values +=
 			    StringUtil::Format("(%d, %d, %s, %d, %s, %s)", column_mapping.mapping_id.index,
 			                       name_map_column.column_id, SQLString(name_map_column.source_name),
 			                       name_map_column.target_field_id.index, parent_column, is_partition);
+			name_map_count++;
+			
+			if (name_map_count >= BATCH_SIZE) {
+				batch_query += "INSERT INTO {METADATA_CATALOG}.ducklake_name_mapping VALUES " + name_map_values + ";";
+				name_map_values.clear();
+				name_map_count = 0;
+			}
 		}
 	}
-	string batch_query;
-	batch_query += "INSERT INTO {METADATA_CATALOG}.ducklake_column_mapping VALUES " + column_mapping_insert_query + ";";
-	batch_query += "INSERT INTO {METADATA_CATALOG}.ducklake_name_mapping VALUES " + name_map_insert_query + ";";
+	
+	// Flush remaining
+	if (column_mapping_count > 0) {
+		batch_query += "INSERT INTO {METADATA_CATALOG}.ducklake_column_mapping VALUES " + column_mapping_values + ";";
+	}
+	if (name_map_count > 0) {
+		batch_query += "INSERT INTO {METADATA_CATALOG}.ducklake_name_mapping VALUES " + name_map_values + ";";
+	}
 	return batch_query;
 }
 
