@@ -164,7 +164,7 @@ public:
 	virtual string WriteNewColumns(const vector<DuckLakeNewColumn> &new_columns);
 	virtual string WriteNewTags(const vector<DuckLakeTagInfo> &new_tags);
 	virtual string WriteNewColumnTags(const vector<DuckLakeColumnTagInfo> &new_tags);
-	virtual string WriteNewDataFiles(const vector<DuckLakeFileInfo> &new_files,
+	virtual string WriteNewDataFiles(DuckLakeSnapshot &commit_snapshot, const vector<DuckLakeFileInfo> &new_files,
 	                                 const vector<DuckLakeTableInfo> &new_tables,
 	                                 vector<DuckLakeSchemaInfo> &new_schemas_result);
 	virtual string WriteNewInlinedData(DuckLakeSnapshot &commit_snapshot,
@@ -256,6 +256,10 @@ protected:
 protected:
 	string GetInlinedTableQuery(const DuckLakeTableInfo &table, const string &table_name);
 	string GetColumnType(const DuckLakeColumnInfo &col);
+
+	//! Execute a batch INSERT immediately (used for large data file inserts)
+	void ExecuteBatchInsert(DuckLakeSnapshot &snapshot, string &values_accumulator,
+	                        const string &table_name, idx_t &count);
 
 	//! Get path relative to catalog path
 	DuckLakePath GetRelativePath(const string &path);

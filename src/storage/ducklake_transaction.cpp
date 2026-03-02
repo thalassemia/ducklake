@@ -1660,7 +1660,7 @@ string DuckLakeTransaction::CommitChanges(DuckLakeCommitState &commit_state,
 		fprintf(stderr, "[DuckLake Commit]   GetNewDataFiles (%llu files) took %lld ms\n",
 		        (unsigned long long)result.new_files.size(),
 		        std::chrono::duration_cast<std::chrono::milliseconds>(after_get_data_files - data_files_start).count());
-		batch_queries += metadata_manager->WriteNewDataFiles(result.new_files, new_tables_result, new_schemas_result);
+		metadata_manager->WriteNewDataFiles(commit_snapshot, result.new_files, new_tables_result, new_schemas_result);
 		auto after_write_data_files = std::chrono::steady_clock::now();
 		fprintf(stderr, "[DuckLake Commit]   WriteNewDataFiles took %lld ms\n",
 		        std::chrono::duration_cast<std::chrono::milliseconds>(after_write_data_files - after_get_data_files).count());
@@ -1697,12 +1697,12 @@ string DuckLakeTransaction::CommitChanges(DuckLakeCommitState &commit_state,
 		    GetCompactionChanges(commit_snapshot, CompactionType::MERGE_ADJACENT_TABLES);
 		batch_queries += metadata_manager->WriteCompactions(compaction_merge_adjacent_changes.compacted_files,
 		                                                    CompactionType::MERGE_ADJACENT_TABLES);
-		batch_queries += metadata_manager->WriteNewDataFiles(compaction_merge_adjacent_changes.new_files,
-		                                                     new_tables_result, new_schemas_result);
+		metadata_manager->WriteNewDataFiles(commit_snapshot, compaction_merge_adjacent_changes.new_files,
+		                                    new_tables_result, new_schemas_result);
 
 		auto compaction_rewrite_delete_changes = GetCompactionChanges(commit_snapshot, CompactionType::REWRITE_DELETES);
-		batch_queries += metadata_manager->WriteNewDataFiles(compaction_rewrite_delete_changes.new_files,
-		                                                     new_tables_result, new_schemas_result);
+		metadata_manager->WriteNewDataFiles(commit_snapshot, compaction_rewrite_delete_changes.new_files,
+		                                    new_tables_result, new_schemas_result);
 		batch_queries += metadata_manager->WriteCompactions(compaction_rewrite_delete_changes.compacted_files,
 		                                                    CompactionType::REWRITE_DELETES);
 	}
