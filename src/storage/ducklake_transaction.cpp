@@ -1358,6 +1358,12 @@ NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCo
 		auto &schema = ducklake_catalog.GetSchemaForSnapshot(*this, GetSnapshot());
 		dl_stats = ducklake_catalog.ConstructStatsMap(*stats, schema);
 	}
+
+	// Timing counters
+	int64_t time_get_new_data_file = 0;
+	int64_t time_merge_stats = 0;
+	int64_t time_push_back = 0;
+
 	for (auto &entry : table_data_changes) {
 		auto table_id = commit_state.GetTableId(entry.first);
 		if (table_id.IsTransactionLocal()) {
@@ -1368,6 +1374,10 @@ NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCo
 			// no new data - skip this entry
 			continue;
 		}
+
+		// Pre-reserve space for the result vector to avoid reallocations
+		result.new_files.reserve(result.new_files.size() + table_changes.new_data_files.size());
+
 		// get the global table stats
 		DuckLakeNewGlobalStats new_globals;
 		optional_ptr<DuckLakeTableStats> current_stats;
@@ -1387,6 +1397,8 @@ NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCo
 		auto &new_stats = new_globals.stats;
 		vector<DuckLakeDeleteFile> delete_files;
 		for (auto &file : table_changes.new_data_files) {
+			auto t1 = std::chrono::steady_clock::now();
+
 			// flushed files (with max_partial_file_snapshot) have embedded row_ids, we gotta use the original
 			// row_id_start
 			auto row_id_start =
@@ -1399,6 +1411,9 @@ NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCo
 				delete_files.push_back(std::move(delete_file));
 			}
 
+			auto t2 = std::chrono::steady_clock::now();
+			time_get_new_data_file += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+
 			// merge the stats into the new global states
 			// files with max_partial_file_snapshot set are flushed from inlined data - don't count them again
 			if (!file.max_partial_file_snapshot.IsValid()) {
@@ -1409,7 +1424,14 @@ NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCo
 			for (auto &entry : file.column_stats) {
 				new_stats.MergeStats(entry.first, entry.second);
 			}
+
+			auto t3 = std::chrono::steady_clock::now();
+			time_merge_stats += std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
+
 			result.new_files.push_back(std::move(data_file));
+
+			auto t4 = std::chrono::steady_clock::now();
+			time_push_back += std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
 		}
 		// write any deletes that were made on top of these transaction-local files
 		AddDeletes(table_id, std::move(delete_files));
@@ -1444,6 +1466,10 @@ NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCo
 		// update the global stats for this table based on the newly written data
 		batch_query += UpdateGlobalTableStats(table_id, new_globals);
 	}
+
+	fprintf(stderr, "[DuckLake Commit]     GetNewDataFile: %lld ms, MergeStats: %lld ms, push_back: %lld ms\n",
+	        time_get_new_data_file / 1000, time_merge_stats / 1000, time_push_back / 1000);
+
 	return result;
 }
 
