@@ -1332,12 +1332,8 @@ DuckLakeFileInfo DuckLakeTransaction::GetNewDataFile(DuckLakeDataFile &file, Duc
 	data_file.mapping_id = file.mapping_id;
 	data_file.begin_snapshot = file.begin_snapshot;
 	data_file.max_partial_file_snapshot = file.max_partial_file_snapshot;
-	// gather the column statistics for this file
-	for (auto &column_stats_entry : file.column_stats) {
-		auto column_stats =
-		    DuckLakeColumnStatsInfo::FromColumnStats(column_stats_entry.first, column_stats_entry.second);
-		data_file.column_stats.push_back(std::move(column_stats));
-	}
+	// copy the column statistics directly (typed, not stringified)
+	data_file.column_stats = file.column_stats;
 	for (auto &partition_entry : file.partition_values) {
 		DuckLakeFilePartitionInfo partition_info;
 		partition_info.partition_column_idx = partition_entry.partition_column_idx;

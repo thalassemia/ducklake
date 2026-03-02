@@ -106,6 +106,11 @@ public:
 	virtual bool TypeIsNativelySupported(const LogicalType &type);
 	//! Check if a type supports data inlining on this metadata backend
 	virtual bool SupportsInlining(const LogicalType &type);
+	//! Check if this metadata manager supports the DuckDB Appender API for fast inserts
+	//! Returns true for DuckDB metadata, false for external databases (Postgres, SQLite)
+	virtual bool SupportsAppender() const {
+		return true;
+	}
 	//! Check if a set of LogicalTypes supports data inlining, recursing into nested types
 	bool SupportsInliningTypes(const vector<LogicalType> &types);
 	//! Check if columns (stored as DuckLakeColumnInfo) support inlining, recursing into children
@@ -260,6 +265,11 @@ protected:
 	//! Execute a batch INSERT immediately (used for large data file inserts)
 	void ExecuteBatchInsert(DuckLakeSnapshot &snapshot, string &values_accumulator,
 	                        const string &table_name, idx_t &count);
+
+	//! Optimized data file writing using DuckDB Appender API (only for DuckDB metadata manager)
+	string WriteNewDataFilesWithAppender(DuckLakeSnapshot &commit_snapshot, const vector<DuckLakeFileInfo> &new_files,
+	                                     const vector<DuckLakeTableInfo> &new_tables,
+	                                     vector<DuckLakeSchemaInfo> &new_schemas_result);
 
 	//! Get path relative to catalog path
 	DuckLakePath GetRelativePath(const string &path);
