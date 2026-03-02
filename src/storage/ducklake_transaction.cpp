@@ -2164,13 +2164,20 @@ void DuckLakeTransaction::AppendFiles(TableIndex table_id, vector<DuckLakeDataFi
 		return;
 	}
 	lock_guard<mutex> guard(table_data_changes_lock);
-	std::cout << "[MEMORY DEBUG]   AppendFiles: Acquired lock, getting table_changes" << std::endl;
 	auto &table_changes = table_data_changes[table_id];
-	std::cout << "[MEMORY DEBUG]   AppendFiles: Current new_data_files size: " << table_changes.new_data_files.size() << std::endl;
-	for (auto &file : files) {
-		table_changes.new_data_files.push_back(std::move(file));
+
+	if (table_changes.new_data_files.empty()) {
+		// If empty, just move the entire vector - most efficient path
+		table_changes.new_data_files = std::move(files);
+	} else {
+		// Reserve to avoid reallocations during insertion
+		table_changes.new_data_files.reserve(table_changes.new_data_files.size() + files.size());
+		// Use move_iterator for efficient batch move
+		table_changes.new_data_files.insert(
+		    table_changes.new_data_files.end(),
+		    std::make_move_iterator(files.begin()),
+		    std::make_move_iterator(files.end()));
 	}
-	std::cout << "[MEMORY DEBUG]   AppendFiles: Final new_data_files size: " << table_changes.new_data_files.size() << std::endl;
 }
 
 void DuckLakeTransaction::AppendInlinedData(TableIndex table_id, unique_ptr<DuckLakeInlinedData> new_data) {
