@@ -10,6 +10,9 @@
 #include "duckdb/common/types/vector.hpp"
 #include "storage/ducklake_geo_stats.hpp"
 #include <atomic>
+#include <thread>
+#include <queue>
+#include <condition_variable>
 
 namespace duckdb {
 
@@ -87,7 +90,9 @@ struct DuckLakeFileWithMapping {
 };
 
 struct DuckLakeAddDataFilesState : public GlobalTableFunctionState {
-	DuckLakeAddDataFilesState(ClientContext &context, const vector<string> &globs) {
+	DuckLakeAddDataFilesState(ClientContext &context, const vector<string> &globs,
+	                          DuckLakeTransaction &transaction, const DuckLakeAddDataFilesData &bind_data)
+	    : db(context.db), transaction(transaction), bind_data(bind_data) {
 		// Expand all globs to get the list of files
 		auto &fs = FileSystem::GetFileSystem(context);
 		for (auto &glob : globs) {
@@ -98,101 +103,139 @@ struct DuckLakeAddDataFilesState : public GlobalTableFunctionState {
 		}
 		total_files = files.size();
 
-		// Determine max threads based on number of files
+		// Determine number of worker threads
 		auto scheduler_threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
 		if (total_files > 1) {
-			max_threads = MinValue<idx_t>(total_files, scheduler_threads);
+			num_workers = MinValue<idx_t>(total_files, scheduler_threads);
 		} else {
-			max_threads = 1;
+			num_workers = 1;
 		}
-		fprintf(stderr, "[DuckLake AddFiles] Global init: total_files=%llu, scheduler_threads=%llu, max_threads=%llu\n",
-		        (unsigned long long)total_files, (unsigned long long)scheduler_threads, (unsigned long long)max_threads);
+		fprintf(stderr, "[DuckLake AddFiles] Global init: total_files=%llu, scheduler_threads=%llu, num_workers=%llu\n",
+		        (unsigned long long)total_files, (unsigned long long)scheduler_threads, (unsigned long long)num_workers);
+	}
+	
+	~DuckLakeAddDataFilesState() {
+		// Signal workers to stop and wait for them
+		StopWorkers();
 	}
 
 	idx_t MaxThreads() const override {
-		return max_threads;
+		return 1;  // We handle our own parallelism, tell DuckDB to use single pipeline thread
 	}
 
-	bool NextFile(string &result) {
-		// Use atomic fetch_add to claim a file index without locking
-		// The files vector is read-only after construction, so we can safely read from it
-		idx_t my_idx = current_file_idx.fetch_add(1);
-		if (my_idx >= files.size()) {
-			return false;
-		}
-		result = files[my_idx];  // Copy instead of move since vector is shared
-		return true;
-	}
-
-	void AddProcessedFile(DuckLakeFileWithMapping file_with_map) {
-		// This lock is necessary for vector push_back (not thread-safe)
-		// but contention is low since actual work (file processing) is outside lock
-		lock_guard<mutex> guard(result_lock);
-		processed_files_with_maps.push_back(std::move(file_with_map));
-	}
-
-	vector<DuckLakeFileWithMapping> GetProcessedFiles() {
-		// Only called once during finalization, lock is fine
-		lock_guard<mutex> guard(result_lock);
-		return std::move(processed_files_with_maps);
-	}
-
-	void MarkFileCompleted() {
-		// Atomic increment - no lock needed
-		files_completed.fetch_add(1);
-	}
-
-	bool ShouldFinalize() {
-		// Use compare_exchange to atomically check and set finalized flag
-		// This ensures exactly one thread performs finalization
-		if (files_completed.load() < total_files) {
-			return false;
-		}
+	void StartWorkers() {
 		bool expected = false;
-		return finalized.compare_exchange_strong(expected, true);
+		if (!workers_started.compare_exchange_strong(expected, true)) {
+			return;  // Already started
+		}
+		
+		fprintf(stderr, "[DuckLake AddFiles] Starting %llu worker threads\n", (unsigned long long)num_workers);
+		
+		for (idx_t i = 0; i < num_workers; i++) {
+			workers.emplace_back([this, i]() {
+				WorkerLoop(i);
+			});
+		}
+	}
+	
+	void StopWorkers() {
+		{
+			lock_guard<mutex> guard(queue_lock);
+			stop_workers = true;
+		}
+		queue_cv.notify_all();
+		
+		for (auto &worker : workers) {
+			if (worker.joinable()) {
+				worker.join();
+			}
+		}
+		workers.clear();
+	}
+	
+	void WorkerLoop(idx_t worker_id);  // Defined after DuckLakeFileProcessor
+	
+	bool GetNextResult(DuckLakeFileWithMapping &result) {
+		unique_lock<mutex> guard(queue_lock);
+		
+		// Wait until there's a result or all workers are done
+		queue_cv.wait(guard, [this]() {
+			return !results_queue.empty() || all_workers_done || stop_workers;
+		});
+		
+		if (stop_workers) {
+			return false;
+		}
+		
+		if (!results_queue.empty()) {
+			result = std::move(results_queue.front());
+			results_queue.pop();
+			return true;
+		}
+		
+		// Queue is empty and all workers are done
+		return false;
+	}
+	
+	bool AllDone() {
+		lock_guard<mutex> guard(queue_lock);
+		return all_workers_done && results_queue.empty();
+	}
+	
+	bool HasError() {
+		lock_guard<mutex> guard(queue_lock);
+		return !first_error.empty();
+	}
+	
+	string GetError() {
+		lock_guard<mutex> guard(queue_lock);
+		return first_error;
 	}
 
-	mutex result_lock;  // Only lock needed - for processed_files vector
+	shared_ptr<DatabaseInstance> db;
+	DuckLakeTransaction &transaction;
+	const DuckLakeAddDataFilesData &bind_data;
+	
 	vector<string> files;  // Read-only after construction
 	std::atomic<idx_t> current_file_idx{0};
 	idx_t total_files = 0;
 	std::atomic<idx_t> files_completed{0};
-	idx_t max_threads = 1;
+	idx_t num_workers = 1;
+	
+	// Worker threads
+	std::atomic<bool> workers_started{false};
+	std::atomic<idx_t> active_workers{0};
+	vector<std::thread> workers;
+	
+	// Results queue
+	mutex queue_lock;
+	std::condition_variable queue_cv;
+	std::queue<DuckLakeFileWithMapping> results_queue;
+	bool all_workers_done = false;
+	bool stop_workers = false;
+	string first_error;
+	
+	// Finalization
 	std::atomic<bool> finalized{false};
-	vector<DuckLakeFileWithMapping> processed_files_with_maps;
-	std::atomic<idx_t> next_thread_id{0};
+	vector<DuckLakeFileWithMapping> all_results;  // Collected before finalization
 };
 
 struct DuckLakeAddDataFilesLocalState : public LocalTableFunctionState {
-	// Constructor declared here, defined after DuckLakeFileProcessor is complete
-	DuckLakeAddDataFilesLocalState(ClientContext &context, DuckLakeTransaction &transaction,
-	                               const DuckLakeAddDataFilesData &bind_data, idx_t thread_id);
-
-	DuckLakeTransaction &transaction;
-	unique_ptr<Connection> connection;
-	unique_ptr<DuckLakeFileProcessor> processor;
-	idx_t thread_id;
-	idx_t files_processed = 0;
+	DuckLakeAddDataFilesLocalState() {
+	}
 };
 
 static unique_ptr<GlobalTableFunctionState> DuckLakeAddDataFilesInit(ClientContext &context,
                                                                      TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<DuckLakeAddDataFilesData>();
-	return make_uniq<DuckLakeAddDataFilesState>(context, bind_data.globs);
+	auto &transaction = DuckLakeTransaction::Get(context, bind_data.catalog);
+	return make_uniq<DuckLakeAddDataFilesState>(context, bind_data.globs, transaction, bind_data);
 }
 
 static unique_ptr<LocalTableFunctionState> DuckLakeAddDataFilesInitLocal(ExecutionContext &context,
                                                                           TableFunctionInitInput &input,
                                                                           GlobalTableFunctionState *global_state) {
-	auto &bind_data = input.bind_data->Cast<DuckLakeAddDataFilesData>();
-	auto &gstate = global_state->Cast<DuckLakeAddDataFilesState>();
-	
-	// Assign a unique thread ID for logging
-	idx_t thread_id = gstate.next_thread_id.fetch_add(1);
-	
-	// Get the transaction once per thread, not per file
-	auto &transaction = DuckLakeTransaction::Get(context.client, bind_data.catalog);
-	return make_uniq<DuckLakeAddDataFilesLocalState>(context.client, transaction, bind_data, thread_id);
+	return make_uniq<DuckLakeAddDataFilesLocalState>();
 }
 
 struct ParquetColumn {
@@ -268,15 +311,57 @@ private:
 	unordered_map<string, unique_ptr<ParquetFileMetadata>> parquet_files;
 };
 
-// Constructor defined here after DuckLakeFileProcessor is fully declared
-DuckLakeAddDataFilesLocalState::DuckLakeAddDataFilesLocalState(ClientContext &context, DuckLakeTransaction &transaction,
-                                                               const DuckLakeAddDataFilesData &bind_data, idx_t thread_id)
-    : transaction(transaction), processor(make_uniq<DuckLakeFileProcessor>(transaction, bind_data)),
-      thread_id(thread_id) {
-	// Create a thread-local connection for parallel metadata reading
-	// This avoids serialization on the shared transaction connection lock
-	connection = make_uniq<Connection>(*context.db);
-	fprintf(stderr, "[DuckLake AddFiles] InitLocal: thread_id=%llu initialized\n", (unsigned long long)thread_id);
+// WorkerLoop defined here after DuckLakeFileProcessor is fully declared
+void DuckLakeAddDataFilesState::WorkerLoop(idx_t worker_id) {
+	fprintf(stderr, "[DuckLake AddFiles] Worker %llu: started\n", (unsigned long long)worker_id);
+	
+	// Create thread-local connection for this worker
+	auto connection = make_uniq<Connection>(*db);
+	DuckLakeFileProcessor processor(transaction, bind_data);
+	
+	while (true) {
+		// Get next file to process
+		idx_t my_idx = current_file_idx.fetch_add(1);
+		if (my_idx >= files.size()) {
+			break;  // No more files
+		}
+		
+		const string &file_path = files[my_idx];
+		fprintf(stderr, "[DuckLake AddFiles] Worker %llu: processing file %llu '%s'\n",
+		        (unsigned long long)worker_id, (unsigned long long)my_idx, file_path.c_str());
+		
+		try {
+			auto file_result = processor.ProcessSingleFile(file_path, connection.get());
+			
+			if (file_result.file.row_count > 0) {
+				// Add to results queue
+				lock_guard<mutex> guard(queue_lock);
+				results_queue.push(std::move(file_result));
+				queue_cv.notify_one();
+			}
+		} catch (std::exception &e) {
+			fprintf(stderr, "[DuckLake AddFiles] Worker %llu: error processing '%s': %s\n",
+			        (unsigned long long)worker_id, file_path.c_str(), e.what());
+			// Store error for later
+			lock_guard<mutex> guard(queue_lock);
+			if (first_error.empty()) {
+				first_error = e.what();
+			}
+		}
+		
+		files_completed.fetch_add(1);
+	}
+	
+	fprintf(stderr, "[DuckLake AddFiles] Worker %llu: finished\n", (unsigned long long)worker_id);
+	
+	// Check if this is the last worker to finish
+	idx_t remaining = active_workers.fetch_sub(1) - 1;
+	if (remaining == 0) {
+		// Signal that all workers are done
+		lock_guard<mutex> guard(queue_lock);
+		all_workers_done = true;
+		queue_cv.notify_all();
+	}
 }
 
 void DuckLakeFileProcessor::ReadParquetFullMetadata(const string &glob, Connection *thread_connection) {
@@ -1402,72 +1487,59 @@ DuckLakeFileWithMapping DuckLakeFileProcessor::ProcessSingleFile(const string &f
 
 static void DuckLakeAddDataFilesExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &global_state = data_p.global_state->Cast<DuckLakeAddDataFilesState>();
-	auto &local_state = data_p.local_state->Cast<DuckLakeAddDataFilesLocalState>();
 	auto &bind_data = data_p.bind_data->Cast<DuckLakeAddDataFilesData>();
 	
-	fprintf(stderr, "[DuckLake AddFiles] Execute called: thread_id=%llu, files_processed_by_thread=%llu\n",
-	        (unsigned long long)local_state.thread_id, (unsigned long long)local_state.files_processed);
+	// Start worker threads on first Execute call
+	if (!global_state.workers_started.load()) {
+		global_state.active_workers.store(global_state.num_workers);
+		global_state.StartWorkers();
+	}
+	
+	// Check for errors from workers
+	if (global_state.HasError()) {
+		throw InvalidInputException("Error adding data files: %s", global_state.GetError());
+	}
 	
 	idx_t output_count = 0;
 	
-	// Limit files per Execute call to give scheduler opportunity to spawn more threads
-	// Each Execute call should return relatively quickly to allow pipeline interleaving
-	constexpr idx_t MAX_FILES_PER_EXECUTE = 8;
-	idx_t files_this_call = 0;
-	
-	// Keep processing files until we hit limits or run out of files
-	while (output_count < STANDARD_VECTOR_SIZE && files_this_call < MAX_FILES_PER_EXECUTE) {
-		string file_path;
-		if (!global_state.NextFile(file_path)) {
-			// No more files to process - check if we should finalize
-			fprintf(stderr, "[DuckLake AddFiles] Thread %llu: no more files, checking finalization\n",
-			        (unsigned long long)local_state.thread_id);
-			if (global_state.ShouldFinalize()) {
-				fprintf(stderr, "[DuckLake AddFiles] Thread %llu: performing finalization\n",
-				        (unsigned long long)local_state.thread_id);
-				// Get transaction for finalization (serialized, but happens once)
-				auto &transaction = local_state.transaction;
-				auto files_with_maps = global_state.GetProcessedFiles();
-				if (!files_with_maps.empty()) {
-					// Add all name maps to the transaction and update mapping_ids
-					vector<DuckLakeDataFile> files_to_add;
-					files_to_add.reserve(files_with_maps.size());
-					for (auto &file_with_map : files_with_maps) {
-						// Add the name map to the transaction (serialized, but batched)
-						file_with_map.file.mapping_id = transaction.AddNameMap(std::move(file_with_map.name_map));
-						files_to_add.push_back(std::move(file_with_map.file));
-					}
-					transaction.AppendFiles(bind_data.table.GetTableId(), std::move(files_to_add));
-					fprintf(stderr, "[DuckLake AddFiles] Finalization complete: added %llu files to transaction\n",
-					        (unsigned long long)files_to_add.size());
-				}
-			}
-			break; // Exit loop, no more files
+	// Pull results from worker queue
+	while (output_count < STANDARD_VECTOR_SIZE) {
+		DuckLakeFileWithMapping result;
+		if (!global_state.GetNextResult(result)) {
+			// No more results - workers are done
+			break;
 		}
-
-		fprintf(stderr, "[DuckLake AddFiles] Thread %llu: processing file '%s'\n",
-		        (unsigned long long)local_state.thread_id, file_path.c_str());
 		
-		// Process one file
-		auto result = local_state.processor->ProcessSingleFile(file_path, local_state.connection.get());
-		local_state.files_processed++;
-		files_this_call++;
-
-		if (result.file.row_count > 0) {
-			// Output the filename
-			output.data[0].SetValue(output_count, Value(result.file.file_name));
-			output_count++;
-			
-			// CRITICAL: Add processed file BEFORE marking file completed
-			// This prevents race where another thread finalizes before all files are added
-			global_state.AddProcessedFile(std::move(result));
-		}
-		// Mark file completed AFTER adding to processed files (or skipping if empty)
-		global_state.MarkFileCompleted();
+		// Output the filename
+		output.data[0].SetValue(output_count, Value(result.file.file_name));
+		output_count++;
+		
+		// Store result for finalization
+		global_state.all_results.push_back(std::move(result));
 	}
 	
-	fprintf(stderr, "[DuckLake AddFiles] Thread %llu: Execute returning with %llu rows\n",
-	        (unsigned long long)local_state.thread_id, (unsigned long long)output_count);
+	// Check if we need to finalize (all workers done, queue empty)
+	if (output_count == 0 && global_state.AllDone()) {
+		bool expected = false;
+		if (global_state.finalized.compare_exchange_strong(expected, true)) {
+			fprintf(stderr, "[DuckLake AddFiles] Finalizing: adding %llu files to transaction\n",
+			        (unsigned long long)global_state.all_results.size());
+			
+			if (!global_state.all_results.empty()) {
+				auto &transaction = global_state.transaction;
+				vector<DuckLakeDataFile> files_to_add;
+				files_to_add.reserve(global_state.all_results.size());
+				
+				for (auto &file_with_map : global_state.all_results) {
+					file_with_map.file.mapping_id = transaction.AddNameMap(std::move(file_with_map.name_map));
+					files_to_add.push_back(std::move(file_with_map.file));
+				}
+				
+				transaction.AppendFiles(bind_data.table.GetTableId(), std::move(files_to_add));
+				fprintf(stderr, "[DuckLake AddFiles] Finalization complete\n");
+			}
+		}
+	}
 	
 	output.SetCardinality(output_count);
 }
