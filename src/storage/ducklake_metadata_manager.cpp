@@ -2817,28 +2817,31 @@ string DuckLakeMetadataManager::FromRelativePath(TableIndex table_id, const Duck
 	return FromRelativePath(path, GetPath(table_id, {}, {}));
 }
 
-// Helper to flush accumulated VALUES and reset the accumulator
-static void FlushBatchInsert(string &batch_query, string &values_accumulator, const string &table_name, idx_t &count) {
+// Helper to execute a batch insert immediately
+void DuckLakeMetadataManager::ExecuteBatchInsert(DuckLakeSnapshot &snapshot, string &values_accumulator, 
+                                                  const string &table_name, idx_t &count) {
 	if (count > 0) {
-		batch_query += "INSERT INTO {METADATA_CATALOG}." + table_name + " VALUES " + values_accumulator + ";";
+		string query = "INSERT INTO {METADATA_CATALOG}." + table_name + " VALUES " + values_accumulator + ";";
+		auto result = transaction.Query(snapshot, query);
+		if (result->HasError()) {
+			result->GetErrorObject().Throw("Failed to insert into " + table_name + ": ");
+		}
 		values_accumulator.clear();
 		count = 0;
 	}
 }
 
-string DuckLakeMetadataManager::WriteNewDataFiles(const vector<DuckLakeFileInfo> &new_files,
+string DuckLakeMetadataManager::WriteNewDataFiles(DuckLakeSnapshot &commit_snapshot,
+                                                  const vector<DuckLakeFileInfo> &new_files,
                                                   const vector<DuckLakeTableInfo> &new_tables,
                                                   vector<DuckLakeSchemaInfo> &new_schemas_result) {
-	string batch_query;
 	if (new_files.empty()) {
-		return batch_query;
+		return "";
 	}
 	
 	// Batch size for INSERT statements - reduces parser memory usage
+	// Each batch is executed immediately to avoid building giant SQL strings
 	constexpr idx_t BATCH_SIZE = 1000;
-	
-	// Pre-reserve capacity to avoid O(n²) string copying
-	batch_query.reserve(new_files.size() * 500);  // Rough estimate per file
 	
 	string data_file_values;
 	string column_stats_values;
@@ -2876,9 +2879,9 @@ string DuckLakeMetadataManager::WriteNewDataFiles(const vector<DuckLakeFileInfo>
 		    file.file_size_bytes, footer_size, row_id, partition_id, encryption_key, mapping, partial_max);
 		data_file_count++;
 		
-		// Flush data file batch if needed
+		// Execute data file batch immediately if full
 		if (data_file_count >= BATCH_SIZE) {
-			FlushBatchInsert(batch_query, data_file_values, "ducklake_data_file", data_file_count);
+			ExecuteBatchInsert(commit_snapshot, data_file_values, "ducklake_data_file", data_file_count);
 			data_file_values.reserve(BATCH_SIZE * 300);
 		}
 		
@@ -2893,9 +2896,9 @@ string DuckLakeMetadataManager::WriteNewDataFiles(const vector<DuckLakeFileInfo>
 			    column_stats.max_val, column_stats.contains_nan, column_stats.extra_stats);
 			column_stats_count++;
 			
-			// Flush column stats batch if needed
+			// Execute column stats batch immediately if full
 			if (column_stats_count >= BATCH_SIZE) {
-				FlushBatchInsert(batch_query, column_stats_values, "ducklake_file_column_stats", column_stats_count);
+				ExecuteBatchInsert(commit_snapshot, column_stats_values, "ducklake_file_column_stats", column_stats_count);
 				column_stats_values.reserve(BATCH_SIZE * 150);
 			}
 			
@@ -2912,7 +2915,7 @@ string DuckLakeMetadataManager::WriteNewDataFiles(const vector<DuckLakeFileInfo>
 				variant_stats_count++;
 				
 				if (variant_stats_count >= BATCH_SIZE) {
-					FlushBatchInsert(batch_query, variant_stats_values, "ducklake_file_variant_stats", variant_stats_count);
+					ExecuteBatchInsert(commit_snapshot, variant_stats_values, "ducklake_file_variant_stats", variant_stats_count);
 				}
 			}
 		}
@@ -2929,18 +2932,19 @@ string DuckLakeMetadataManager::WriteNewDataFiles(const vector<DuckLakeFileInfo>
 			partition_count++;
 			
 			if (partition_count >= BATCH_SIZE) {
-				FlushBatchInsert(batch_query, partition_values, "ducklake_file_partition_value", partition_count);
+				ExecuteBatchInsert(commit_snapshot, partition_values, "ducklake_file_partition_value", partition_count);
 			}
 		}
 	}
 	
-	// Flush remaining data
-	FlushBatchInsert(batch_query, data_file_values, "ducklake_data_file", data_file_count);
-	FlushBatchInsert(batch_query, column_stats_values, "ducklake_file_column_stats", column_stats_count);
-	FlushBatchInsert(batch_query, partition_values, "ducklake_file_partition_value", partition_count);
-	FlushBatchInsert(batch_query, variant_stats_values, "ducklake_file_variant_stats", variant_stats_count);
+	// Execute remaining batches
+	ExecuteBatchInsert(commit_snapshot, data_file_values, "ducklake_data_file", data_file_count);
+	ExecuteBatchInsert(commit_snapshot, column_stats_values, "ducklake_file_column_stats", column_stats_count);
+	ExecuteBatchInsert(commit_snapshot, partition_values, "ducklake_file_partition_value", partition_count);
+	ExecuteBatchInsert(commit_snapshot, variant_stats_values, "ducklake_file_variant_stats", variant_stats_count);
 
-	return batch_query;
+	// Return empty string - all inserts executed inline
+	return "";
 }
 
 string DuckLakeMetadataManager::DropDataFiles(const set<DataFileIndex> &dropped_files) {
