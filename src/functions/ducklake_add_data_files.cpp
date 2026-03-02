@@ -77,6 +77,9 @@ static unique_ptr<FunctionData> DuckLakeAddDataFilesBind(ClientContext &context,
 	return std::move(result);
 }
 
+// Forward declaration needed for LocalState
+struct DuckLakeFileProcessor;
+
 // Result structure that includes both the file and its name map
 struct DuckLakeFileWithMapping {
 	DuckLakeDataFile file;
@@ -161,15 +164,9 @@ struct DuckLakeAddDataFilesState : public GlobalTableFunctionState {
 };
 
 struct DuckLakeAddDataFilesLocalState : public LocalTableFunctionState {
+	// Constructor declared here, defined after DuckLakeFileProcessor is complete
 	DuckLakeAddDataFilesLocalState(ClientContext &context, DuckLakeTransaction &transaction,
-	                               const DuckLakeAddDataFilesData &bind_data, idx_t thread_id)
-	    : transaction(transaction), processor(make_uniq<DuckLakeFileProcessor>(transaction, bind_data)),
-	      thread_id(thread_id) {
-		// Create a thread-local connection for parallel metadata reading
-		// This avoids serialization on the shared transaction connection lock
-		connection = make_uniq<Connection>(*context.db);
-		fprintf(stderr, "[DuckLake AddFiles] InitLocal: thread_id=%llu initialized\n", (unsigned long long)thread_id);
-	}
+	                               const DuckLakeAddDataFilesData &bind_data, idx_t thread_id);
 
 	DuckLakeTransaction &transaction;
 	unique_ptr<Connection> connection;
@@ -270,6 +267,17 @@ private:
 	HivePartitioningType hive_partitioning;
 	unordered_map<string, unique_ptr<ParquetFileMetadata>> parquet_files;
 };
+
+// Constructor defined here after DuckLakeFileProcessor is fully declared
+DuckLakeAddDataFilesLocalState::DuckLakeAddDataFilesLocalState(ClientContext &context, DuckLakeTransaction &transaction,
+                                                               const DuckLakeAddDataFilesData &bind_data, idx_t thread_id)
+    : transaction(transaction), processor(make_uniq<DuckLakeFileProcessor>(transaction, bind_data)),
+      thread_id(thread_id) {
+	// Create a thread-local connection for parallel metadata reading
+	// This avoids serialization on the shared transaction connection lock
+	connection = make_uniq<Connection>(*context.db);
+	fprintf(stderr, "[DuckLake AddFiles] InitLocal: thread_id=%llu initialized\n", (unsigned long long)thread_id);
+}
 
 void DuckLakeFileProcessor::ReadParquetFullMetadata(const string &glob, Connection *thread_connection) {
 	// Use thread-local connection for parallel metadata reading if provided
